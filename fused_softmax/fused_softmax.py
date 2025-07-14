@@ -10,15 +10,13 @@ import torch
 import triton
 import triton.language as tl
 
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+DEVICE = torch.device(f"cuda:{torch.cuda.current_device()}" if torch.cuda.is_available() else "cpu")
 
-# GPU Properties
 properties = triton.runtime.driver.active.utils.get_device_properties(DEVICE.index)
 NUM_SM = properties["multiprocessor_count"]
 NUM_REGS = properties["max_num_regs"]
 TOTAL_SRAM_PER_SM = properties["max_shared_mem"]
-WARP_SIZE = properties["warp_size"]
-
+WARP_SIZE = properties["warpSize"]
 
 def naive_softmax(x: torch.Tensor):
     # assume input size is (M, N)
@@ -43,6 +41,7 @@ def naive_softmax(x: torch.Tensor):
 
 def softmax(x: torch.Tensor):
     assert x.ndim == 2
+    assert x.is_contiguous()
     n_rows, n_cols = x.shape
 
     # assume rows fit in SRAM
@@ -59,18 +58,85 @@ def softmax(x: torch.Tensor):
     y = torch.empty_like(x)
 
     kernel = _softmax_kernel.warmup(
-        x, y
+        x, y,
+        x.stride(0), y.stride(0),
         n_rows, n_cols,
         BLOCK_SIZE=BLOCK_SIZE,
         num_stages=num_stages,
         num_warps=num_warps,
         grid=(1,)
     )
+    assert kernel is not None
     kernel._init_handles()
     n_regs_per_program = kernel.n_regs
     sram_needed_per_program = kernel.metadata.shared
 
-    reg_occupance = NUM_REGS // n_regs_per_program
+    reg_occupancy = NUM_REGS // (n_regs_per_program * WARP_SIZE * num_warps)
+    # EXAMPLE
+    # NUM_REGS = 65536 (64 KB)
+    # each program might use 
+    #     n_regs_per_program = 32
+    #     WARP_SIZE = 32
+    #     num_warps = 8
+    # so each program needs (n_regs_per_program * WARP_SIZE * num_warps) registers total
+    # all programs in SM share registers
+    # therefore we may fit reg_occupancy programs on each SM
+    # 65536 // (32 * 32 * 8) = 8 programs per SM
+
+    sram_occupancy = TOTAL_SRAM_PER_SM // sram_needed_per_program
+
+    programs_per_sm = min(reg_occupancy, sram_occupancy)
+
+    num_programs = min(NUM_SM * programs_per_sm, n_rows)
+
+    grid = (num_programs, 1, 1)
+
+    kernel[grid](
+        x, y,
+        x.stride(0), y.stride(0),
+        n_rows, n_cols,
+        BLOCK_SIZE,
+        num_stages
+    )
+
+    # x.stride()
+    # x is shape (M, N)
+    # x.stride() would be (N, 1)
+    # x.stride(0) would be N
+    # x.stride(1) would be 1
+    # z is shape (B, N, D)
+    # z.stride() is (N x D, D, 1)
+    # each entry is proportional to product of suffix
+
+    return y
+
+@triton.jit
+def _softmax_kernel(
+    input_ptr, output_ptr,
+    input_row_stride, output_row_stride,
+    n_rows, n_cols,
+    BLOCK_SIZE: tl.constexpr,
+    num_stages: tl.constexpr
+):
+    # shape (M, N)
+    # BLOCK_SIZE = next power of 2 bigger than N
+    pid = tl.program_id(0)
+    row_step = tl.num_programs(0)
+    for row_idx in tl.range(pid, n_rows, row_step, num_stages=num_stages):
+        row_start_ptr = input_ptr + row_idx * input_row_stride
+        col_offsets = tl.arange(0, BLOCK_SIZE)
+        input_ptrs = row_start_ptr + col_offsets
+        mask = col_offsets < n_cols
+        row = tl.load(input_ptrs, mask=mask, other=float("-inf")) # shape (BLOCK_SIZE) roughly (n_cols)
+
+        row_minus_max = row - tl.max(row, axis=0) # shape (BLOCK_SIZE) - (1) -> (BLOCK_SIZE)
+        numerator = tl.exp(row_minus_max) # shape (BLOCK_SIZE)
+        denominator = tl.sum(numerator, axis=0) # shape (1)
+        softmax_output = numerator / denominator # shape (BLOCK_SIZE) / (1) -> (BLOCK_SIZE)
+
+        output_row_start_ptr = output_ptr + row_idx * output_row_stride
+        tl.store(output_row_start_ptr + col_offsets, softmax_output, mask=mask)
+
 
 def test_softmax_kernel(size: tuple, atol=1e-3, rtol=1e-3, device=DEVICE):
     assert type(size) == tuple and len(size) == 2
@@ -81,3 +147,5 @@ def test_softmax_kernel(size: tuple, atol=1e-3, rtol=1e-3, device=DEVICE):
     torch.testing.assert_close(z_triton, z_torch, atol=atol, rtol=rtol)
     print("PASSED")
 
+if __name__ == "__main__":
+    test_softmax_kernel(size=(1823, 781))
