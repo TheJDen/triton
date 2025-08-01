@@ -79,10 +79,10 @@ def _attn_forward_inner(
                 {"BLOCK_SIZE_QO": BLOCK_SIZE_QO, "BLOCK_SIZE_KV": BLOCK_SIZE_KV},
                 num_stages=num_stages, num_warps=num_warps
             )
-            for BLOCK_SIZE_QO in [16]#, 32, 64, 128]
-            for BLOCK_SIZE_KV in [16]#, 32, 64, 128]
+            for BLOCK_SIZE_QO in [16, 32, 64, 128]
+            for BLOCK_SIZE_KV in [16, 32, 64, 128]
             for num_stages in [3]#, 5, 7]
-            for num_warps in [4]#, 8, 16]
+            for num_warps in [4,]#8, 16]
         ],
         key=["Dh"]
 )
@@ -175,8 +175,153 @@ def attn_fwd(
     tl.store(O_ptr + O_offsets, O, mask=mask_QO_N[:, None])
 
 
+@triton.autotune(
+        [
+            triton.Config(
+                {"PRE_BLOCK_SIZE_ROW": PRE_BLOCK_SIZE_ROW},
+                num_stages=num_stages, num_warps=num_warps
+            )
+            for PRE_BLOCK_SIZE_ROW in [16, 32, 64, 128]
+            for num_stages in [3]#, 5, 7]
+            for num_warps in [4,]#8, 16]
+        ],
+        key=["Dh"]
+)
+@triton.jit
+def attn_backward_preprocess(
+    O_ptr, dLdO_ptr, delta_ptr,
+    stride_O_B, stride_O_H, stride_O_N, stride_O_Dh,
+    stride_delta_B, stride_delta_H, stride_delta_N,
+    N, Dh: tl.constexpr,
+    PRE_BLOCK_SIZE_ROW: tl.constexpr
+):
+    index_BH = tl.program_id(axis=1)
+    row = tl.program_id(axis=0)
+    row_offsets = row * PRE_BLOCK_SIZE_ROW + tl.arange(0, PRE_BLOCK_SIZE_ROW)
+    col_offsets = tl.arange(0, Dh)
+    mask = row_offsets < N
+
+    O_ptr += index_BH * stride_O_H
+    O_offsets = row_offsets[:, None] * stride_O_N + col_offsets[None, :] * stride_O_Dh # shape (PRE_BLOCK_SIZE_ROW, Dh)
+    O = tl.load(O_ptr + O_offsets, mask=mask[:, None], other=0.0) 
+
+    dLdO_ptr += index_BH * stride_O_H
+    dLdO_offsets = row_offsets[:, None] * stride_O_N + col_offsets[None, :] * stride_O_Dh
+    dLdO = tl.load(dLdO_ptr + dLdO_offsets, mask=mask[:, None], other=0.0)
+
+    delta = tl.sum(dLdO * O, axis=1) # size (PRE_BLOCK_SIZE_ROW,)
+    delta_ptr += index_BH * stride_delta_H
+    tl.store(delta_ptr + row_offsets, delta, mask=mask)
 
 
+@triton.jit
+def _attention_backward_KV(
+    K, V, dLdK, dLdV,
+    Q_ptr, dLdO_ptr, LSE_ptr, delta_ptr,
+    stride_Q_N, stride_Q_Dh,
+    BLOCK_SIZE_ROW_1, BLOCK_SIZE_COL_1,
+    H, N, Dh: tl.constexpr,
+    BLOCK_SIZE_ROW, BLOCK_SIZE_COL,
+    start_ROW, start_COL, num_steps,
+    scale, ln2, rln2,
+    MASK: tl.constexpr
+):
+    pass
+
+@triton.autotune(
+        [
+            triton.Config(
+                {"BLOCK_SIZE_MACRO": BLOCK_SIZE_MACRO, "BLOCK_SIZE_MICRO": BLOCK_SIZE_MICRO},
+                num_stages=num_stages, num_warps=num_warps
+            )
+            for BLOCK_SIZE_MICRO in [16, 32, 64]
+            for BLOCK_SIZE_MACRO in [32, 64, 128]
+            for num_stages in [3]#, 5, 7]
+            for num_warps in [4,]#8, 16]
+            if BLOCK_SIZE_MICRO < BLOCK_SIZE_MACRO
+        ],
+        key=["Dh"]
+)
+@triton.jit
+def attn_backward(
+    Q_ptr, K_ptr, V_ptr,
+    dLdO_ptr, dLdQ_ptr, dLdK_ptr, dLdV_ptr,
+    LSE_ptr, delta_ptr,
+    scale,
+    stride_Q_B, stride_Q_H, stride_Q_N, stride_Q_Dh,
+    H, N, Dh: tl.constexpr,
+    BLOCK_SIZE_MACRO: tl.constexpr, BLOCK_SIZE_MICRO: tl.constexpr
+):
+    ln2: tl.constexpr = 0.6931471824645996
+    rln2: tl.constexpr = 1.4426950408889634
+
+    idx_BH = tl.program_id(axis=1)
+    idx_B = idx_BH // H
+    idx_H = idx_BH % H
+
+    BH_jump = idx_B * stride_Q_B + idx_H * stride_Q_H
+    Q_ptr += BH_jump
+    K_ptr += BH_jump
+    V_ptr += BH_jump
+    dLdO_ptr += BH_jump
+    dLdQ_ptr += BH_jump
+    dLdK_ptr += BH_jump
+    dLdV_ptr += BH_jump
+
+    BH_jump = idx_BH * N # LSE has shape (B, H, N), so LSE.stride() == (H*N, N, 1); LSE.stride(1) == N
+    LSE_ptr += BH_jump
+    delta_ptr += BH_jump
+
+    tl.static_assert(BLOCK_SIZE_MACRO % BLOCK_SIZE_MICRO == 0)
+
+    # dLdK and dLdV
+    BLOCK_SIZE_ROW_1: tl.constexpr = BLOCK_SIZE_MICRO
+    BLOCK_SIZE_COL_1: tl.constexpr = BLOCK_SIZE_MACRO
+
+    pid = tl.program_id(axis=0)
+    start_COL = pid * BLOCK_SIZE_COL_1
+    start_ROW = start_COL
+    num_steps = BLOCK_SIZE_COL_1 // BLOCK_SIZE_ROW_1
+
+    offsets_COL_1 = start_COL + tl.arange(0, BLOCK_SIZE_COL_1)
+    offsets_Dh = tl.arange(0, Dh)
+    KV_offsets = offsets_COL_1[:, None] * stride_Q_N + offsets_Dh[None, :] * stride_Q_Dh
+    KV_mask = offsets_COL_1[:, None] < N
+    K = tl.load(K_ptr + KV_offsets, mask=KV_mask, other=0.0) 
+    V = tl.load(V_ptr + KV_offsets, mask=KV_mask, other=0.0) # shape (BLOCK_SIZE_COL_1, Dh)
+
+    K *= scale * rln2
+
+    dLdK = tl.zeros((BLOCK_SIZE_COL_1, Dh), dtype=tl.float32)
+    dLdV = tl.zeros((BLOCK_SIZE_COL_1, Dh), dtype=tl.float32)
+
+    dLdK, dLdV = _attention_backward_KV(
+        K, V, dLdK, dLdV,
+        Q_ptr, dLdO_ptr, LSE_ptr, delta_ptr,
+        stride_Q_N, stride_Q_Dh,
+        BLOCK_SIZE_ROW_1, BLOCK_SIZE_COL_1,
+        start_ROW, start_COL, num_steps,
+        scale, ln2, rln2,
+        MASK=True
+    )
+
+    start_ROW += BLOCK_SIZE_MACRO
+    N_adj = tl.cdiv(N, BLOCK_SIZE_COL_1) * BLOCK_SIZE_COL_1
+    num_steps = (N_adj - start_ROW) // BLOCK_SIZE_MICRO
+
+    dLdK, dLdV = _attention_backward_KV(
+        K, V, dLdK, dLdV,
+        Q_ptr, dLdO_ptr, LSE_ptr, delta_ptr,
+        stride_Q_N, stride_Q_Dh,
+        BLOCK_SIZE_ROW_1, BLOCK_SIZE_COL_1,
+        start_ROW, start_COL, num_steps,
+        scale, ln2, rln2,
+        MASK=False
+    )
+
+    # dLdQ
+    BLOCK_SIZE_ROW_2: tl.constexpr = BLOCK_SIZE_MICRO
+    BLOCK_SIZE_COL_2: tl.constexpr = BLOCK_SIZE_MACRO
 
 
 class _flashattention(torch.autograd.Function):
@@ -212,6 +357,41 @@ class _flashattention(torch.autograd.Function):
         ctx.B, ctx.H, ctx.N, ctx.Dh = B, H, N, Dh
         ctx.scale = scale
         return O
+    
+    @staticmethod
+    def backward(ctx, dLdO):
+        q, k, v, O, LSE = ctx.saved_tensors
+        grid = ctx.grid
+        B, H, N, Dh = ctx.B, ctx.H, ctx.N, ctx.Dh
+        scale = ctx.scale
+
+        dLdq = torch.empty_like(q)
+        dLdk = torch.empty_like(k)
+        dLdv = torch.empty_like(v)
+
+        dLdO = dLdO.contiguous()
+        assert q.stride() == k.stride() == v.stride() == O.stride() == dLdO.stride()
+
+        delta = torch.empty_like(LSE) # shape (B, H, N)
+        pre_grid = lambda meta: (triton.cdiv(N, meta["PRE_BLOCK_SIZE_ROW"]), B * H)
+        attn_backward_preprocess[pre_grid](
+            O, dLdO, delta,
+            O.stride(0), O.stride(1), O.stride(2), O.stride(3),
+            delta.stride(0), delta.stride(1), delta.stride(2),
+            N, Dh
+        )
+
+        grid = lambda meta: (triton.cdiv(N, meta["BLOCK_SIZE_MACRO"]), B * H)
+        attn_backward[grid](
+            q, k, v,
+            dLdO, dLdq, dLdk, dLdv,
+            LSE, delta,
+            scale,
+            q.stride(0), q.stride(1), q.stride(2), q.stride(3),
+            H, N, Dh
+        )
+
+        return dLdq, dLdk, dLdv, None
 
 flash_attention = _flashattention.apply
 
@@ -220,10 +400,24 @@ def test_flash_attention_kernel(B, H, N, Dh, device=DEVICE, atol=5e-3):
     k = torch.randn((B, H, N, Dh), device=device, dtype=torch.float32, requires_grad=True)
     v = torch.randn((B, H, N, Dh), device=device, dtype=torch.float32, requires_grad=True)
     scale = 1 / math.sqrt(Dh)
+
+    # forward
     attention_triton = flash_attention(q, k, v, scale)
     attention_torch = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=True)
     torch.testing.assert_close(attention_triton, attention_torch, atol=atol, rtol=0)
     print(f"Forward test passed for B={B}, H={H}, N={N}, Dh={Dh}")
+    
+    # backward
+    dLdO = 0.1 * torch.randn_like(q)
+    attention_triton.backward(dLdO, retain_graph=True)
+    dLdq_triton, dLdk_triton, dLdv_triton = [tensor.grad.clone() for tensor in [q, k, v]]
+    q.grad, k.grad, v.grad = None, None, None
+    attention_torch.backward(dLdO, retain_graph=True)
+    dLdq_torch, dLdk_torch, dLdv_torch = [tensor.grad.clone() for tensor in [q, k, v]]
+    torch.testing.assert_close(dLdq_triton, dLdq_torch, atol=atol, rtol=0)
+    torch.testing.assert_close(dLdk_triton, dLdk_torch, atol=atol, rtol=0)
+    torch.testing.assert_close(dLdv_triton, dLdv_torch, atol=atol, rtol=0)
+    print(f"Backward test passed for B={B}, H={H}, N={N}, Dh={Dh}")
 
 configs = [
     triton.testing.Benchmark(
@@ -237,7 +431,7 @@ configs = [
         plot_name=f"attention-performance-{mode}",
         args={"mode": mode}
     )
-    for mode in ["fwd"]
+    for mode in ["fwd", "bwd"]
 ]
 
 @triton.testing.perf_report(configs)
