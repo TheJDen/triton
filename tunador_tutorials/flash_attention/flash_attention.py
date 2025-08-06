@@ -213,20 +213,90 @@ def attn_backward_preprocess(
     delta_ptr += index_BH * stride_delta_H
     tl.store(delta_ptr + row_offsets, delta, mask=mask)
 
+@triton.jit
+def _attention_backward_Q(
+    Q, dLdO, dLdQ, LSE,
+    K_ptr, V_ptr, delta_ptr,
+    stride_Q_N, stride_Q_Dh,
+    H, N, Dh: tl.constexpr,
+    BLOCK_SIZE_ROW: tl.constexpr,
+    BLOCK_SIZE_COL: tl.constexpr,
+    start_ROW, start_COL, num_steps,
+    scale, ln2: tl.constexpr, rln2: tl.constexpr,
+    MASK: tl.constexpr
+):
+    offsets_ROW = start_ROW + tl.arange(0, BLOCK_SIZE_ROW)
+    offsets_COL = start_COL + tl.arange(0, BLOCK_SIZE_COL)
+    offsets_Dh = tl.arange(0, Dh)
+
+    K_and_V_T_offsets = offsets_Dh[:, None] * stride_Q_Dh + offsets_COL[None, :] * stride_Q_N
+    delta = tl.load(delta_ptr + offsets_ROW, mask=offsets_ROW < N, other=0.0)
+
+    for block_idx in range(num_steps):
+        KV_mask = (offsets_COL < N)[None, :]
+        K_T = tl.load(K_ptr + K_and_V_T_offsets, mask=KV_mask, other=0.0) # shape (Dh, BLOCK_SIZE_COL)
+        V_T = tl.load(V_ptr + K_and_V_T_offsets, mask=KV_mask, other=0.0) 
+
+        S = tl.dot(Q, K_T) # shape (BLOCK_SIZE_ROW, BLOCK_SIZE_COL)
+        P = tl.exp2(S - LSE) # shape (BLOCK_SIZE_ROW, BLOCK_SIZE_COL)
+
+        if MASK:
+            P = tl.where(offsets_ROW[:, None] >= offsets_COL[None, :], P, 0.)
+
+        dLdP = tl.dot(dLdO, V_T) # shape (BLOCK_SIZE_ROW, BLOCK_SIZE_COL)
+        dLdS = P * (dLdP - delta[:, None]) * ln2
+
+        dLdQ = tl.dot(dLdS, tl.trans(K_T), acc=dLdQ) # shape (BLOCK_SIZE_ROW, Dh)
+
+        offsets_COL += BLOCK_SIZE_COL
+        K_ptr += BLOCK_SIZE_COL * stride_Q_N
+        V_ptr += BLOCK_SIZE_COL * stride_Q_N
+
+    return dLdQ
+
 
 @triton.jit
 def _attention_backward_KV(
     K, V, dLdK, dLdV,
     Q_ptr, dLdO_ptr, LSE_ptr, delta_ptr,
     stride_Q_N, stride_Q_Dh,
-    BLOCK_SIZE_ROW_1, BLOCK_SIZE_COL_1,
     H, N, Dh: tl.constexpr,
     BLOCK_SIZE_ROW, BLOCK_SIZE_COL,
     start_ROW, start_COL, num_steps,
     scale, ln2, rln2,
     MASK: tl.constexpr
 ):
-    pass
+    offsets_ROW = start_ROW + tl.arange(0, BLOCK_SIZE_ROW)
+    offsets_COL = start_COL + tl.arange(0, BLOCK_SIZE_COL)
+    offsets_Dh = tl.arange(0, Dh)
+
+    Q_T_offsets = offsets_Dh[:, None] * stride_Q_Dh + offsets_ROW[None, :] * stride_Q_N
+    dLdO_offsets = offsets_ROW[:, None] * stride_Q_N + offsets_Dh[None, :] * stride_Q_Dh
+
+    for block_idx in range(num_steps):
+        mask_N = offsets_ROW < N
+        Q_T = tl.load(Q_ptr + Q_T_offsets, mask=mask_N[None, :], other=0.0) # shape (Dh, BLOCK_SIZE_ROW)
+        LSE = tl.load(LSE_ptr + offsets_ROW, mask=mask_N, other=0.0) # shape (BLOCK_SIZE_ROW)
+        dLdO = tl.load(dLdO_ptr + dLdO_offsets, mask=mask_N[:, None], other=0.0) # shape (BLOCK_SIZE_ROW, Dh)
+        delta = tl.load(delta_ptr + offsets_ROW, mask=mask_N, other=0.0) # shape (BLOCK_SIZE_ROW,)
+
+        S_T = tl.dot(K, Q_T) # shape (BLOCK_SIZE_COL, BLOCK_SIZE_ROW)
+        P_T = tl.exp2(S_T - LSE[None, :]) # shape (BLOCK_SIZE_COL, BLOCK_SIZE_ROW)
+
+        if MASK:
+            mask = (offsets_COL[:, None] <= offsets_ROW[None, :])
+            P_T = tl.where(mask, P_T, 0.)
+
+        dLdV = tl.dot(P_T, dLdO, acc=dLdV)
+        dLdP_T = tl.dot(V, tl.trans(dLdO)) # shape (BLOCK_SIZE_COL, BLOCK_SIZE_ROW)
+        dLdS_T = (P_T * (dLdP_T - delta[None, :]) * ln2) # shape (BLOCK_SIZE_COL, BLOCK_SIZE_ROW)
+        dLdK = tl.dot(dLdS_T, tl.trans(Q_T), acc=dLdK) # shape (BLOCK_SIZE_COL, Dh)
+
+        offsets_ROW += BLOCK_SIZE_ROW
+        Q_ptr += BLOCK_SIZE_ROW * stride_Q_N
+        dLdO_ptr += BLOCK_SIZE_ROW * stride_Q_N
+
+    return dLdK, dLdV
 
 @triton.autotune(
         [
@@ -235,7 +305,7 @@ def _attention_backward_KV(
                 num_stages=num_stages, num_warps=num_warps
             )
             for BLOCK_SIZE_MICRO in [16, 32, 64]
-            for BLOCK_SIZE_MACRO in [32, 64, 128]
+            for BLOCK_SIZE_MACRO in [32, 64]#, 128]
             for num_stages in [3]#, 5, 7]
             for num_warps in [4,]#8, 16]
             if BLOCK_SIZE_MICRO < BLOCK_SIZE_MACRO
@@ -299,6 +369,7 @@ def attn_backward(
         K, V, dLdK, dLdV,
         Q_ptr, dLdO_ptr, LSE_ptr, delta_ptr,
         stride_Q_N, stride_Q_Dh,
+        H, N, Dh,
         BLOCK_SIZE_ROW_1, BLOCK_SIZE_COL_1,
         start_ROW, start_COL, num_steps,
         scale, ln2, rln2,
@@ -313,15 +384,63 @@ def attn_backward(
         K, V, dLdK, dLdV,
         Q_ptr, dLdO_ptr, LSE_ptr, delta_ptr,
         stride_Q_N, stride_Q_Dh,
+        H, N, Dh,
         BLOCK_SIZE_ROW_1, BLOCK_SIZE_COL_1,
         start_ROW, start_COL, num_steps,
         scale, ln2, rln2,
         MASK=False
     )
 
+    dLdK *= scale * rln2
+    tl.store(dLdK_ptr + KV_offsets, dLdK, mask=KV_mask)
+    tl.store(dLdV_ptr + KV_offsets, dLdV, mask=KV_mask)
+
     # dLdQ
-    BLOCK_SIZE_ROW_2: tl.constexpr = BLOCK_SIZE_MICRO
-    BLOCK_SIZE_COL_2: tl.constexpr = BLOCK_SIZE_MACRO
+    BLOCK_SIZE_ROW_2: tl.constexpr = BLOCK_SIZE_MACRO
+    BLOCK_SIZE_COL_2: tl.constexpr = BLOCK_SIZE_MICRO
+
+    start_ROW = pid * BLOCK_SIZE_ROW_2
+    start_COL = start_ROW
+    num_steps = BLOCK_SIZE_ROW_2 // BLOCK_SIZE_COL_2
+
+    offsets_ROW = start_ROW + tl.arange(0, BLOCK_SIZE_ROW_2)
+    QO_offsets = offsets_ROW[:, None] * stride_Q_N + offsets_Dh[None, :] * stride_Q_Dh
+    mask_ROW = offsets_ROW < N
+    Q = tl.load(Q_ptr + QO_offsets, mask=mask_ROW[:, None], other=0.0)
+    Q *= scale * rln2
+    dLdO = tl.load(dLdO_ptr + QO_offsets, mask=mask_ROW[:, None], other=0.0)
+    LSE = tl.load(LSE_ptr + offsets_ROW, mask=mask_ROW, other=0.0)[:, None]
+
+    dLdQ = tl.zeros([BLOCK_SIZE_ROW_2, Dh], dtype=tl.float32)
+    
+    dLdQ = _attention_backward_Q(
+        Q, dLdO, dLdQ, LSE,
+        K_ptr, V_ptr, delta_ptr,
+        stride_Q_N, stride_Q_Dh,
+        H, N, Dh,
+        BLOCK_SIZE_ROW_2, BLOCK_SIZE_COL_2,
+        start_ROW, start_COL, num_steps,
+        scale, ln2, rln2,
+        MASK=True
+    )
+
+    end_COL = start_COL
+    start_COL = 0
+    num_steps = end_COL // BLOCK_SIZE_COL_2
+
+    dLdQ = _attention_backward_Q(
+        Q, dLdO, dLdQ, LSE,
+        K_ptr, V_ptr, delta_ptr,
+        stride_Q_N, stride_Q_Dh,
+        H, N, Dh,
+        BLOCK_SIZE_ROW_2, BLOCK_SIZE_COL_2,
+        start_ROW, start_COL, num_steps,
+        scale, ln2, rln2,
+        MASK=False
+    )
+
+    dLdQ *= scale * rln2
+    tl.store(dLdQ_ptr + QO_offsets, dLdQ, mask=mask_ROW[:, None])
 
 
 class _flashattention(torch.autograd.Function):
@@ -395,7 +514,7 @@ class _flashattention(torch.autograd.Function):
 
 flash_attention = _flashattention.apply
 
-def test_flash_attention_kernel(B, H, N, Dh, device=DEVICE, atol=5e-3):
+def test_flash_attention_forward(B, H, N, Dh, device=DEVICE, atol=5e-3):
     q = torch.randn((B, H, N, Dh), device=device, dtype=torch.float32, requires_grad=True)
     k = torch.randn((B, H, N, Dh), device=device, dtype=torch.float32, requires_grad=True)
     v = torch.randn((B, H, N, Dh), device=device, dtype=torch.float32, requires_grad=True)
@@ -406,6 +525,16 @@ def test_flash_attention_kernel(B, H, N, Dh, device=DEVICE, atol=5e-3):
     attention_torch = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=True)
     torch.testing.assert_close(attention_triton, attention_torch, atol=atol, rtol=0)
     print(f"Forward test passed for B={B}, H={H}, N={N}, Dh={Dh}")
+
+def test_flash_attention_backward(B, H, N, Dh, device=DEVICE, atol=5e-3):
+    q = torch.randn((B, H, N, Dh), device=device, dtype=torch.float32, requires_grad=True)
+    k = torch.randn((B, H, N, Dh), device=device, dtype=torch.float32, requires_grad=True)
+    v = torch.randn((B, H, N, Dh), device=device, dtype=torch.float32, requires_grad=True)
+    scale = 1 / math.sqrt(Dh)
+
+    # forward
+    attention_triton = flash_attention(q, k, v, scale)
+    attention_torch = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=True)
     
     # backward
     dLdO = 0.1 * torch.randn_like(q)
@@ -439,7 +568,7 @@ def benchmark_flash_attention(SEQ_LEN, mode, provider, device=DEVICE):
     assert mode in ["fwd", "bwd"]
     dtype = torch.float32
     BATCH, N_HEADS = 32, 4
-    HEAD_DIM = 128
+    HEAD_DIM = 64 # i think 128 is too big for my 1660
     q = torch.randn((BATCH, N_HEADS, SEQ_LEN, HEAD_DIM), device=device, dtype=dtype, requires_grad=True)
     k = torch.randn((BATCH, N_HEADS, SEQ_LEN, HEAD_DIM), device=device, dtype=dtype, requires_grad=True)
     v = torch.randn((BATCH, N_HEADS, SEQ_LEN, HEAD_DIM), device=device, dtype=dtype, requires_grad=True)
@@ -460,10 +589,16 @@ def benchmark_flash_attention(SEQ_LEN, mode, provider, device=DEVICE):
     return total_flops * 1e-12 / (ms * 1e-3)  # TFLOPS
 
 if __name__ == "__main__":
-    test_flash_attention_kernel(1, 1, 128, 32)
-    test_flash_attention_kernel(1, 1, 128, 64)
-    test_flash_attention_kernel(1, 1, 128, 128)
-    test_flash_attention_kernel(32, 8, 69, 128)
+
+    test_flash_attention_forward(1, 1, 128, 32)
+    test_flash_attention_forward(1, 1, 128, 64)
+    test_flash_attention_forward(1, 1, 128, 128)
+    test_flash_attention_forward(32, 8, 69, 128)
+
+    test_flash_attention_backward(1, 1, 128, 32)
+    test_flash_attention_backward(1, 1, 128, 64)
+    test_flash_attention_backward(1, 1, 128, 128)
+    test_flash_attention_backward(32, 8, 69, 128)
 
     import sys
     if len(sys.argv) > 1 and sys.argv[1] == "--benchmark":
