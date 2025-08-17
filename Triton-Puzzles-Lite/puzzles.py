@@ -303,10 +303,29 @@ def add_vec_block_spec(x: Float32[100,], y: Float32[90,]) -> Float32[90, 100]:
 def add_vec_block_kernel(
     x_ptr, y_ptr, z_ptr, N0, N1, B0: tl.constexpr, B1: tl.constexpr
 ):
-    block_id_x = tl.program_id(0)
-    block_id_y = tl.program_id(1)
-    # Finish me!
-    return
+    pid_0 = tl.program_id(0)
+    pid_1 = tl.program_id(1)
+    x_offsets = tl.arange(0, B0) + pid_0 * B0
+    y_offsets = tl.arange(0, B1) + pid_1 * B1
+    x_mask = x_offsets < N0
+    y_mask = y_offsets < N1
+    x = tl.load(x_ptr + x_offsets, mask=x_mask)
+    y = tl.load(y_ptr + y_offsets, mask=y_mask)
+    z_block = x[None, :] + y[:, None]
+    z_offsets = y_offsets[:, None] * N0 + x_offsets[None, :]
+    z_mask = x_mask[None, :] & y_mask[:, None]
+    tl.store(z_ptr + z_offsets, z_block, mask=z_mask)
+
+
+# p1 = 4
+# p2 = 7
+# b0 = 2
+# b1 = 4
+# x = torch.arange(0, b0) + 2
+# y = torch.arange(0, b1) + 7
+# print(x, y)
+# print(x[:, None], y[None, :])
+# print(y[:, None] * 4 + x[None, :])
 
 
 r"""
