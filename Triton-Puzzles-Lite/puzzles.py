@@ -262,8 +262,24 @@ def add_vec_spec(x: Float32[32,], y: Float32[32,]) -> Float32[32, 32]:
 
 @triton.jit
 def add_vec_kernel(x_ptr, y_ptr, z_ptr, N0, N1, B0: tl.constexpr, B1: tl.constexpr):
-    # Finish me!
-    return
+    x_offsets = tl.arange(0, B0)
+    y_offsets = tl.arange(0, B1)
+    x = tl.load(x_ptr + x_offsets)
+    y = tl.load(y_ptr + y_offsets)
+    outer_sum = x[None, :] + y[:, None]
+    z_offsets = x_offsets[:, None] * B0 + y_offsets[None, :]
+    tl.store(z_ptr + z_offsets, outer_sum)
+# m x n
+# A[i][j] = A[i * m + j]
+    
+
+# x = torch.tensor([7, 13])
+# y = torch.tensor([3, 4])
+#        7   13
+# 3.     10. 16
+
+# 4.     11. 17
+# print(add_vec_spec(x, y))
 
 
 r"""
