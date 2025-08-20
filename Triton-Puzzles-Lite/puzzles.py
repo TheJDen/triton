@@ -349,10 +349,18 @@ def mul_relu_block_spec(x: Float32[100,], y: Float32[90,]) -> Float32[90, 100]:
 def mul_relu_block_kernel(
     x_ptr, y_ptr, z_ptr, N0, N1, B0: tl.constexpr, B1: tl.constexpr
 ):
-    block_id_x = tl.program_id(0)
-    block_id_y = tl.program_id(1)
-    # Finish me!
-    return
+    pid_0 = tl.program_id(0)
+    pid_1 = tl.program_id(1)
+    x_offsets = tl.arange(0, B0) + pid_0 * B0
+    y_offsets = tl.arange(0, B1) + pid_1 * B1
+    x_mask = x_offsets < N0
+    y_mask = y_offsets < N1
+    x_block = tl.load(x_ptr + x_offsets, x_mask)
+    y_block = tl.load(y_ptr + y_offsets, y_mask)
+    outer_product = tl.maximum(x_block[None, :] * y_block[:, None], 0.0)
+    z_offsets = y_offsets[:, None] * N0 + x_offsets[None, :]
+    z_mask = x_mask[None, :]  & y_mask[:, None]
+    tl.store(z_ptr + z_offsets, outer_product, mask=z_mask)
 
 
 r"""
