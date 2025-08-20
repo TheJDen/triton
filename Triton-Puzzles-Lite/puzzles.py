@@ -390,6 +390,8 @@ def mul_relu_block_back_spec(
     z = torch.relu(x * y[:, None])
     z.backward(dz)
     dx = x.grad
+
+    print(x.shape, z.shape, dz.shape, dx.shape)
     return dx
 
 
@@ -397,10 +399,27 @@ def mul_relu_block_back_spec(
 def mul_relu_block_back_kernel(
     x_ptr, y_ptr, dz_ptr, dx_ptr, N0, N1, B0: tl.constexpr, B1: tl.constexpr
 ):
-    block_id_i = tl.program_id(0)
-    block_id_j = tl.program_id(1)
-    # Finish me!
-    return
+    pid_0 = tl.program_id(0)
+    pid_1 = tl.program_id(1)
+
+    i_offsets = tl.arange(0, B0) + pid_0 * B0
+    j_offsets = tl.arange(0, B1) + pid_1 * B1
+
+    i_mask = i_offsets < N0
+    j_mask = j_offsets < N1
+
+    y_block = tl.load(y_ptr + j_offsets, j_mask)
+
+    ji_offsets = j_offsets[:, None] * N0 + i_offsets[None, :]
+    mask = i_mask[None, :] & j_mask[:, None]
+    x_block = tl.load(x_ptr + ji_offsets, mask)
+    
+    outer_product = x_block * y_block[:, None]
+
+    dz_block = tl.load(dz_ptr + ji_offsets, mask=mask)
+
+    dx = tl.where(outer_product > 0, y_block[:, None] * dz_block, 0.0)
+    tl.store(dx_ptr + ji_offsets, dx, mask=mask)
 
 
 r"""
