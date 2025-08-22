@@ -443,8 +443,20 @@ def sum_spec(x: Float32[4, 200]) -> Float32[4,]:
 
 @triton.jit
 def sum_kernel(x_ptr, z_ptr, N0, N1, T, B0: tl.constexpr, B1: tl.constexpr):
-    # Finish me!
-    return
+    pid = tl.program_id(0) # which rows we are summing
+    i_offsets = tl.arange(0, B0) + pid * B0
+    i_mask = i_offsets < N0
+    z_block = tl.zeros((B0,), dtype=tl.float32) # create new vector in SRAM
+    for block in tl.range(0, T, B1): # which columns we are summing
+      block_id = tl.cdiv(block, B1)
+      j_offsets = tl.arange(0, B1) + block_id * B1
+      block_offsets = i_offsets[:, None] * T + j_offsets[None, :]
+      j_mask = j_offsets < T
+      ij_mask = i_mask[:, None] & j_mask[None, :]
+      x_block = tl.load(x_ptr + block_offsets, ij_mask)
+      summ = tl.sum(x_block, 1)
+      z_block += summ
+    tl.store(z_ptr + i_offsets, z_block, i_mask)
 
 
 r"""
