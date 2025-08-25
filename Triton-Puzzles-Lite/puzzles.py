@@ -492,22 +492,68 @@ def softmax_spec(x: Float32[4, 200]) -> Float32[4, 200]:
 
 @triton.jit
 def softmax_kernel(x_ptr, z_ptr, N0, N1, T, B0: tl.constexpr, B1: tl.constexpr):
-    """2 loops ver."""
-    block_id_i = tl.program_id(0)
+    pid_0 = tl.program_id(0)
     log2_e = 1.44269504
-    # Finish me!
-    return
+    i_offsets = tl.arange(0, B0) + pid_0 * B0
+    i_mask = i_offsets < N0
+    maxx = tl.full((B0,), -float("inf"), dtype=tl.float32)
+    for block in tl.range(0, T, B1):
+      j_offsets = tl.arange(0, B1) + block
+      j_mask = j_offsets < T
+      ij_offsets = i_offsets[:, None] * T + j_offsets[None, :]
+      ij_mask = i_mask[:, None] & j_mask[None, :]
+      x_block = tl.load(x_ptr + ij_offsets, ij_mask)
+      maxx = tl.maximum(maxx, tl.max(x_block, axis=1))
+    denominator = tl.zeros((B0,), dtype=tl.float32)
+    for block in tl.range(0, T, B1):
+      j_offsets = tl.arange(0, B1) + block
+      j_mask = j_offsets < T
+      ij_offsets = i_offsets[:, None] * T + j_offsets[None, :]
+      ij_mask = i_mask[:, None] & j_mask[None, :]
+      x_block = tl.load(x_ptr + ij_offsets, ij_mask)
+      denominator += tl.sum(tl.exp(x_block - maxx))
+    for block in tl.range(0, T, B1):
+      j_offsets = tl.arange(0, B1) + block
+      j_mask = j_offsets < T
+      ij_offsets = i_offsets[:, None] * T + j_offsets[None, :]
+      ij_mask = i_mask[:, None] & j_mask[None, :]
+      x_block = tl.load(x_ptr + ij_offsets, ij_mask)
+      softmax = tl.exp(x_block - maxx) / denominator
+      tl.store(z_ptr + ij_offsets, softmax, ij_mask)
 
 
 @triton.jit
 def softmax_kernel_brute_force(
     x_ptr, z_ptr, N0, N1, T, B0: tl.constexpr, B1: tl.constexpr
 ):
-    """3 loops ver."""
-    block_id_i = tl.program_id(0)
+    pid_0 = tl.program_id(0)
     log2_e = 1.44269504
-    # Finish me!
-    return
+    i_offsets = tl.arange(0, B0) + pid_0 * B0
+    i_mask = i_offsets < N0
+    maxx = tl.full((B0,), -float("inf"), dtype=tl.float32)
+    for block in tl.range(0, T, B1):
+      j_offsets = tl.arange(0, B1) + block
+      j_mask = j_offsets < T
+      ij_offsets = i_offsets[:, None] * T + j_offsets[None, :]
+      ij_mask = i_mask[:, None] & j_mask[None, :]
+      x_block = tl.load(x_ptr + ij_offsets, ij_mask)
+      maxx = tl.maximum(maxx, tl.max(x_block, axis=1))
+    denominator = tl.zeros((B0,), dtype=tl.float32)
+    for block in tl.range(0, T, B1):
+      j_offsets = tl.arange(0, B1) + block
+      j_mask = j_offsets < T
+      ij_offsets = i_offsets[:, None] * T + j_offsets[None, :]
+      ij_mask = i_mask[:, None] & j_mask[None, :]
+      x_block = tl.load(x_ptr + ij_offsets, ij_mask)
+      denominator += tl.sum(tl.exp(x_block - maxx))
+    for block in tl.range(0, T, B1):
+      j_offsets = tl.arange(0, B1) + block
+      j_mask = j_offsets < T
+      ij_offsets = i_offsets[:, None] * T + j_offsets[None, :]
+      ij_mask = i_mask[:, None] & j_mask[None, :]
+      x_block = tl.load(x_ptr + ij_offsets, ij_mask)
+      softmax = tl.exp(x_block - maxx) / denominator
+      tl.store(z_ptr + ij_offsets, softmax, ij_mask)
 
 
 r"""
